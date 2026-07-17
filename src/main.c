@@ -72,6 +72,15 @@ int isolate_child(void) {
 	int ret = 0;
 	sigset_t set;
 
+	// First try to become a session leader with the console as the
+	// controlling terminal, so that the application gets job control
+	// and interactive shells stop complaining about missing ttys.
+	// If that is not possible (no tty, unknown console device), fall
+	// back to plain process group handling below.
+	if (setup_controlling_tty() == 0) {
+		return 0;
+	}
+
 	ret = sigemptyset(&set);
 	if (ret) {
 		perror("sigemptyset");

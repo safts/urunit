@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <stdio.h> 
+#include <stdio.h>
 #include <limits.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 
 #include <linux/reboot.h>
@@ -365,6 +366,94 @@ void unmount_external() {
 
 int set_subreaper() {
 	return prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+}
+
+// The ioctl to get the device number of the terminal behind an alias
+// device such as /dev/console. Define it for libcs that do not expose it.
+#ifndef TIOCGDEV
+#define TIOCGDEV 0x80045432
+#endif
+
+// setup_controlling_tty: Makes the calling process a session leader with the
+// system console as its controlling terminal.
+//
+// The kernel hands init its stdio on /dev/console, which can never become a
+// controlling terminal. As a result the application gets no controlling
+// terminal at all: job control does not work and interactive shells print
+// "can't access tty; job control turned off". To fix this, we find the real
+// terminal behind /dev/console (TIOCGDEV on stdin), reopen that device,
+// start a new session and adopt the device as the controlling terminal
+// (TIOCSCTTY), pointing stdio to the new file descriptor.
+//
+// Return value:
+// On success 0 is returned: the process is a session leader, the console is
+// its controlling terminal and stdio point to it.
+// Otherwise -1 is returned and nothing has changed for the calling process,
+// hence the caller can fall back to plain process group handling.
+int setup_controlling_tty(void) {
+	// The console devices urunc guests boot with (virtio-console,
+	// x86 UART, arm64 PL011) and the VGA console as a last resort.
+	static const char *candidates[] = {
+		"/dev/hvc0", "/dev/ttyS0", "/dev/ttyAMA0", "/dev/tty1", NULL
+	};
+	unsigned int con_dev = 0;
+	int fd = -1;
+	int i = 0;
+
+	if (!isatty(STDIN_FILENO)) {
+		return -1;
+	}
+
+	// Find the device number of the real terminal behind /dev/console.
+	if (ioctl(STDIN_FILENO, TIOCGDEV, &con_dev) != 0) {
+		return -1;
+	}
+
+	for (i = 0; candidates[i]; i++) {
+		struct stat st = { 0 };
+
+		fd = open(candidates[i], O_RDWR | O_NOCTTY);
+		if (fd < 0) {
+			continue;
+		}
+		// The comparison is exact, since for the small major/minor
+		// numbers of console devices the kernel's encoding in TIOCGDEV
+		// matches the libc's dev_t encoding.
+		if (fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) &&
+		    st.st_rdev == (dev_t)con_dev) {
+			DEBUG_PRINTF("Console device is %s\n", candidates[i]);
+			break;
+		}
+		close(fd);
+		fd = -1;
+	}
+	if (fd < 0) {
+		DEBUG_PRINT("Could not match the console device\n");
+		return -1;
+	}
+
+	if (setsid() < 0) {
+		perror("setsid");
+		close(fd);
+		return -1;
+	}
+	// From this point on there is no way back to the old session, so we
+	// keep going even if any of the following calls fail. In the worst
+	// case the app keeps running on the console without job control,
+	// which was the previous behavior anyway.
+	if (ioctl(fd, TIOCSCTTY, 0) != 0) {
+		perror("TIOCSCTTY");
+	}
+	if (dup2(fd, STDIN_FILENO) < 0 ||
+	    dup2(fd, STDOUT_FILENO) < 0 ||
+	    dup2(fd, STDERR_FILENO) < 0) {
+		perror("dup2 console");
+	}
+	if (fd > STDERR_FILENO) {
+		close(fd);
+	}
+
+	return 0;
 }
 
 void request_reboot() {
