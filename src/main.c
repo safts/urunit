@@ -1146,6 +1146,21 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 				// Be safe, ensure the status code is indeed between 0 and 255.
 				*child_exitcode_ptr = *child_exitcode_ptr % (STATUS_MAX - STATUS_MIN + 1);
 
+				/* The app is what we are here to supervise, so stop
+				 * waiting now that it is gone. Continuing would block
+				 * in waitpid() on whatever else is still running --
+				 * a sidecar started before us and inherited when we
+				 * became PID 1, for instance -- and that process has
+				 * no reason to ever exit. main() would then never get
+				 * to see the exit code, and the shutdown below it
+				 * (sync, unmount, reboot) would never run: the guest
+				 * stays up forever with nothing left to do.
+				 *
+				 * Anything still alive is dealt with by the shutdown
+				 * itself, which syncs and unmounts before asking the
+				 * platform to power the machine off.
+				 */
+				return 0;
 			}
 			continue;
 		}
