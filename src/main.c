@@ -1544,11 +1544,25 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 				record_exit_status(reaped_status);
 
 				// The app is done. The agent urunit started would
-				// otherwise run forever, so ask it to exit; it is
-				// reaped by this loop like every other child. Nothing
-				// else is signalled: any other process still around
-				// is the app's responsibility.
+				// otherwise run forever, so ask it to exit.
 				stop_agent();
+
+				/* The app is what we are here to supervise, so stop
+				 * waiting now that it is gone. Continuing would block
+				 * in waitpid() on whatever else is still running --
+				 * a sidecar started before us and inherited when we
+				 * became PID 1, for instance -- and that process has
+				 * no reason to ever exit. main() would then never get
+				 * to see the exit code, and the shutdown below it
+				 * (sync, unmount, reboot) would never run: the guest
+				 * stays up forever with nothing left to do.
+				 *
+				 * Anything still alive is terminated by
+				 * terminate_remaining() before the shutdown syncs and
+				 * unmounts and asks the platform to power the machine
+				 * off.
+				 */
+				return 0;
 			} else if (reaped_pid == agent_pid) {
 				// Forget the agent, so that its pid is not signalled
 				// later, when it may have been reused.
