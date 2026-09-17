@@ -42,6 +42,7 @@
 
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <signal.h>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -54,6 +55,14 @@
 
 #define STATUS_MAX 255
 #define STATUS_MIN 0
+
+// URUNIT_AGENT_PATH: The agent (e.g. the urunc exec agent) urunit starts as
+// its own child before the application, when the file exists and is
+// executable. It is staged there by the boot initrd of a container boot.
+#define URUNIT_AGENT_PATH "/run/urunc/urunit-agent"
+
+// The pid of the agent urunit started, 0 when there is none or it was reaped.
+static pid_t agent_pid = 0;
 
 struct process_config {
 	uint32_t uid;
@@ -1279,6 +1288,64 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 	return 0;
 }
 
+// spawn_agent: Starts the agent at URUNIT_AGENT_PATH, if there is one, as a
+// child of urunit. The agent inherits urunit's environment and standard
+// streams (the console) and runs in its own process group, so that terminal
+// signals meant for the application do not reach it. It is reaped by the
+// reaping loop like every other child; its exit does not end the guest, and
+// it is asked to exit (SIGTERM) once the application has exited. A failure to
+// start it is reported and does not prevent the application from starting.
+//
+// Arguments:
+// No arguments.
+//
+// Return value:
+// No return value.
+void spawn_agent() {
+	char *agent_argv[] = { URUNIT_AGENT_PATH, NULL };
+	pid_t pid;
+
+	if (access(URUNIT_AGENT_PATH, X_OK) != 0) {
+		DEBUG_PRINTF("No agent at %s, nothing to start\n", URUNIT_AGENT_PATH);
+		return;
+	}
+
+	DEBUG_PRINTF("Starting agent %s\n", URUNIT_AGENT_PATH);
+	pid = fork();
+	if (pid < 0) {
+		perror("fork agent");
+		return;
+	} else if (pid == 0) {
+		if (setpgid(0, 0) < 0) {
+			perror("setpgid agent");
+		}
+		execv(agent_argv[0], agent_argv);
+		fprintf(stderr, "exec agent %s ", agent_argv[0]);
+		perror("failed");
+		_exit(127);
+	}
+	agent_pid = pid;
+}
+
+// stop_agent: Asks the agent urunit started, if it is still running, to exit
+// with SIGTERM. Called once the application has exited, since the agent would
+// otherwise run forever and keep the guest from shutting down.
+//
+// Arguments:
+// No arguments.
+//
+// Return value:
+// No return value.
+void stop_agent() {
+	if (agent_pid <= 0) {
+		return;
+	}
+	DEBUG_PRINTF("Asking agent %d to exit\n", agent_pid);
+	if (kill(agent_pid, SIGTERM) < 0 && errno != ESRCH) {
+		perror("kill agent");
+	}
+}
+
 int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 	pid_t reaped_pid = 0;
 	int reaped_status = 0;
@@ -1319,6 +1386,17 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 				// Be safe, ensure the status code is indeed between 0 and 255.
 				*child_exitcode_ptr = *child_exitcode_ptr % (STATUS_MAX - STATUS_MIN + 1);
 
+				// The app is done. The agent urunit started would
+				// otherwise run forever, so ask it to exit; it is
+				// reaped by this loop like every other child. Nothing
+				// else is signalled: any other process still around
+				// is the app's responsibility.
+				stop_agent();
+			} else if (reaped_pid == agent_pid) {
+				// Forget the agent, so that its pid is not signalled
+				// later, when it may have been reused.
+				DEBUG_PRINT("The agent exited\n");
+				agent_pid = 0;
 			}
 			continue;
 		}
@@ -1365,6 +1443,11 @@ int main(int argc, char *argv[]) {
 		perror("Become subreaper");
 		return 1;
 	}
+
+	// The agent is started before the app, as urunit's own child, so that
+	// urunit reaps it too.
+	DEBUG_PRINT("Spawn the agent, if any\n");
+	spawn_agent();
 
 	DEBUG_PRINT("Spawn the app\n");
 	ret = spawn_app(argc, argv, &app_pid);
