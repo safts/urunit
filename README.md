@@ -17,6 +17,10 @@ The key features of `urunit` are:
 - Reading and setting the environment variables for an application from a file.
 - Reading and setting the execution environment configuration for a process from a file.
 - Reading and mounting attached block devices defined in the configuration file.
+- Starting the agent at `/run/urunc/urunit-agent`, when present, as its own
+  child before the application (e.g. the `urunc exec` agent) and reaping it.
+  Once the application exits the agent is sent `SIGTERM`, and `urunit` waits,
+  as always, for every remaining child before shutting down.
 
 ## Building
 
