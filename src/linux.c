@@ -455,6 +455,15 @@ int configure_network(struct net_config *net) {
 }
 
 void request_reboot(void) {
+	// urunit shuts the guest down by asking the kernel to reset, which the VMM
+	// turns into an exit (qemu with -no-reboot, firecracker on any reset). Cloud
+	// Hypervisor instead restarts the VM on a reset, so when urunc sets
+	// URUNIT_POWEROFF the guest powers off (ACPI) instead, which Cloud Hypervisor
+	// turns into a clean exit. Power off needs ACPI in the guest kernel.
+	int cmd = LINUX_REBOOT_CMD_RESTART;
+	if (getenv("URUNIT_POWEROFF") != NULL) {
+		cmd = LINUX_REBOOT_CMD_POWER_OFF;
+	}
 	syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
-		LINUX_REBOOT_CMD_RESTART, NULL);
+		cmd, NULL);
 }
