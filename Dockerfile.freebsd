@@ -21,7 +21,7 @@ RUN apk add --no-cache clang lld make curl tar xz
 # FreeBSD sysroot: headers plus the (static) libraries and startup objects from
 # the base distribution. Only the parts a sysroot needs are extracted.
 RUN mkdir -p /sysroot && \
-    curl -fsSL "https://download.freebsd.org/releases/amd64/amd64/${FREEBSD_VERSION}/base.txz" \
+    curl -fsSL "https://archive.freebsd.org/old-releases/amd64/${FREEBSD_VERSION}/base.txz" \
       | tar -xJf - -C /sysroot ./lib ./usr/lib ./usr/include
 
 COPY Makefile .
