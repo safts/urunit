@@ -1,0 +1,181 @@
+name: Build/publish urunit staging images
+
+# Publishes ghcr.io/<owner>/urunit from the staging branch as a single
+# multi-platform image (linux/amd64, linux/arm64 and freebsd/amd64), tagged
+# latest and with the short commit SHA.
+
+on:
+  push:
+    branches: ["staging"]
+    # Anything the images are built from has to appear here, or a change to it
+    # leaves the published image stale.
+    paths:
+      - 'src/**'
+      - 'Makefile'
+      - 'Dockerfile'
+      - 'Dockerfile.freebsd'
+      - 'VERSION'
+      - '.github/workflows/build-staging.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-linux:
+    name: Build urunit for linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read # to check the repository out
+      packages: write # for uploading the image
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # An image reference may not contain an uppercase letter, and
+      # github.repository keeps the owner's case.
+      - name: Set the image name and short SHA
+        run: |
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+          echo "SHA_SHORT=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push urunit for linux/${{ matrix.arch }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # master
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          tags: ${{ env.IMAGE_NAME }}:${{ matrix.arch }}-${{ env.SHA_SHORT }}
+          push: true
+          provenance: false
+
+  build-freebsd:
+    # Cross-compiled on a Linux runner (see Dockerfile.freebsd). Buildx stamps
+    # the image with os=freebsd, so the manifest list below picks it up for
+    # FreeBSD guests.
+    name: Build urunit for freebsd/amd64
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read # to check the repository out
+      packages: write # for uploading the image
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set the image name and short SHA
+        run: |
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+          echo "SHA_SHORT=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push urunit for freebsd/amd64
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # master
+        with:
+          context: .
+          file: Dockerfile.freebsd
+          platforms: freebsd/amd64
+          tags: ${{ env.IMAGE_NAME }}:freebsd-amd64-${{ env.SHA_SHORT }}
+          push: true
+          provenance: false
+
+  manifest:
+    name: Publish the multi-platform image
+    needs: [build-linux, build-freebsd]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write # for uploading the manifest list
+      id-token: write # to complete the identity challenge with sigstore/fulcio
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Set the image name and short SHA
+        run: |
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+          echo "SHA_SHORT=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The per-platform images carry their platform in their config, so
+      # imagetools builds the manifest list from them as they are.
+      - name: Create and push the manifest list
+        id: manifest
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE_NAME}:latest" \
+            -t "${IMAGE_NAME}:${SHA_SHORT}" \
+            "${IMAGE_NAME}:amd64-${SHA_SHORT}" \
+            "${IMAGE_NAME}:arm64-${SHA_SHORT}" \
+            "${IMAGE_NAME}:freebsd-amd64-${SHA_SHORT}"
+          docker buildx imagetools inspect "${IMAGE_NAME}:${SHA_SHORT}"
+          digest=$(docker buildx imagetools inspect "${IMAGE_NAME}:${SHA_SHORT}" \
+            --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # main
+
+      - name: Sign the published image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE_NAME}@${DIGEST}" \
+            -a "repo=${{ github.repository }}" \
+            -a "workflow=${{ github.workflow }}" \
+            -a "ref=${{ github.sha }}"
