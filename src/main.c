@@ -231,121 +231,133 @@ char *read_file_and_size(char *file, size_t *size) {
 	return buf;
 }
 
-// measure_tokens: Measures how many tokens found in a string, searching at most
-// max_size bytes.
+// The configuration consists of records. Every record is a NUL-terminated
+// string and the configuration begins with the CONFIG_MAGIC record. Since
+// neither environment variables nor arguments can contain a NUL character,
+// every value is stored verbatim, even if it contains new lines.
+// A configuration without the CONFIG_MAGIC record is in the legacy format,
+// where the records are separated with new lines instead.
+#define CONFIG_MAGIC "URUNIT1"
+
+// record_iter: Iterates over the NUL-terminated records of the configuration,
+// starting at pos and stopping at end.
+struct record_iter {
+	char *pos;
+	char *end;
+};
+
+// next_record: Returns the next non-empty record and moves the iterator past
+// it. Empty records carry no information (e.g. the zero padding of a raw block
+// device or consecutive new lines in the legacy format) and are skipped.
 //
 // Arguments:
-// 1. str_buf:	The string to search at
-// 2. max_size:	The max size of bytes to llok at the string
-// 3. tok:	The character to search for.
+// 1. iter:	The iterator over the configuration records.
 //
 // Return value:
-// It returns the number of times the character was found.
-size_t measure_tokens(char *str_buf, size_t max_size, char tok) {
-	size_t i = 0;
-	size_t cnt = 0;
+// A pointer to the next record or NULL if there are no more records.
+char *next_record(struct record_iter *iter) {
+	while (iter->pos < iter->end) {
+		char *rec = iter->pos;
+		size_t len = strnlen(rec, iter->end - rec);
 
-	// Keep searching till we reach the max_size or
-	// the end of string '\0'
-	while (i < max_size && str_buf[i] != 0) {
-		if (str_buf[i] == tok) {
-			cnt++;
-		}
-		i++;
+		// The configuration buffer always has a trailing NUL right
+		// after end, hence the last record is terminated even if it
+		// reaches end.
+		iter->pos = rec + len + 1;
+		if (len > 0)
+			return rec;
 	}
+
+	return NULL;
+}
+
+// count_records: Counts the records from the current position of the iterator
+// until the end_marker record or the end of the configuration. The iterator
+// is passed by value and therefore stays intact.
+//
+// Arguments:
+// 1. iter:		The iterator over the configuration records.
+// 2. end_marker:	The record that ends the counting.
+//
+// Return value:
+// The number of records found before end_marker.
+size_t count_records(struct record_iter iter, const char *end_marker) {
+	size_t cnt = 0;
+	char *rec = NULL;
+
+	while ((rec = next_record(&iter)) != NULL && strcmp(rec, end_marker) != 0)
+		cnt++;
 
 	return cnt;
 }
 
-// parse_envs: Parses a list with one string in every line. The list should begin
-// with the special string "UES" and each line should contain an environment
-// variable. The last line in the list should be the special string "UEE"
-// Given such a list, it constructs an array of pointers to strings where each
-// pointer points to a single environment variable. The array is properly
-// formatted to be passed as the environment variables table at execve and friends.
-// It is important to note, that this function will alter the given list,
-// replacing the new line characters with the end of string '\0' character.
-// The funtion returns a dynamically allocated memory for storing the environment
-// variables array and the caller is responsible to free that memory.
+// is_field: Checks whether a record is a "KEY:VALUE" field with the given key.
+// The whole key, followed by ':', has to match.
 //
 // Arguments:
-// 1. string_area:	The list with in the aformentioned format. If this function
-//			returns successfully, then this pointer will move after the end
-//			of the environment variable list, passed the end of The
-//			"UEE" string.
-// 2. max_sz:		The max possible size of the list.
-// 3. path_env:		A pointer to a string where a pointer to the PATH environment
-//			variable will get stored (if it is found).
+// 1. rec:	The record to check.
+// 2. key:	The key of the field.
 //
 // Return value:
-// It returns an array of strings, where each row points
-// to a single environment variable inside the initial list.
-// Also, if the environment variable PATH was found, then path_env
-// will point to the beginning of that string inside the list.
-char **parse_envs(char **string_area, size_t max_sz, char **path_env) {
+// 1 if the record is a field with the given key, otherwise 0.
+int is_field(const char *rec, const char *key) {
+	size_t key_len = strlen(key);
+
+	return strncmp(rec, key, key_len) == 0 && rec[key_len] == ':';
+}
+
+// parse_envs: Parses the environment variable list. The list begins with the
+// "UES" record (already consumed by the caller) and ends with the "UEE"
+// record. Every record in between is an environment variable. The array of the
+// environment variables points inside the configuration buffer and it is NULL
+// terminated, so it can be passed as the environment variables table at
+// execve and friends. The caller is responsible to free the array.
+//
+// Arguments:
+// 1. iter:	The iterator over the configuration records. On success, it
+//		moves past the "UEE" record.
+// 2. envs:	Will point to the array of the environment variables or NULL
+//		if the list is empty.
+// 3. path_env:	Will point to the PATH environment variable, if it was found.
+//
+// Return value:
+// On success 0 is returned. Otherwise, -1 is returned.
+int parse_envs(struct record_iter *iter, char ***envs, char **path_env) {
 	size_t total_envs = 0;
-	// TODO: We might need to retrun a list here with the first
-	// element being NULL instead of returning NULL
 	char **env_vars = NULL;
-	uint8_t path_found = 0;
-	char *tmp_env = NULL;
+	char *rec = NULL;
 	size_t i = 0;
 
-	// Search how many new line characters we have in the list.
-	total_envs = measure_tokens(*string_area, max_sz, '\n');
-	DEBUG_PRINTF("Found %ld total lines in the environment variables list\n", total_envs);
-
-	// The list starts with "UES"
-	// which will not be stored and therefore, we can use this extra
-	// pointer for the end of the table (NULL), as execve and friends require.
-	// NOTE: If the list contains "UEE", we allocate one more pointer that
-	// is never used.
-	env_vars = malloc(total_envs * sizeof(char *));
+	total_envs = count_records(*iter, "UEE");
+	DEBUG_PRINTF("Found %zu environment variables\n", total_envs);
+	// One more pointer for the end of the table (NULL)
+	env_vars = malloc((total_envs + 1) * sizeof(char *));
 	if (!env_vars) {
 		fprintf(stderr, "Failed to allocate memory for environment variables\n");
-		return NULL;
+		return -1;
 	}
 
-	tmp_env = strtok(*string_area, "\n");
-	// Discard the first string since it is the special string "UES"
-	// Also, it is safe to call strtok, even if there was no '\n', since it will
-	// return NULL again.
-	tmp_env = strtok(NULL, "\n");
-	while (tmp_env && i < total_envs) {
-		// Check if we reached the end of the environment variable list
-		if (memcmp(tmp_env, "UEE", 3) == 0) {
-			*string_area = tmp_env + 4; // 4 bytes for the "UEE" string
-			break;
-		}
-		// Store the environment variable
-		DEBUG_PRINTF("Found env %s\n", tmp_env);
-		env_vars[i] = tmp_env;
-		// If we have not found PATH yet,
-		// check if the current environment variable is PATH.
-		if (!path_found) {
-			if (memcmp(tmp_env, "PATH=", 5) == 0) {
-				DEBUG_PRINTF("Found PATH env %s\n", tmp_env);
-				*path_env = tmp_env;
-				path_found = 1;
+	while ((rec = next_record(iter)) != NULL) {
+		if (strcmp(rec, "UEE") == 0) {
+			env_vars[i] = NULL;
+			if (i == 0) {
+				free(env_vars);
+				env_vars = NULL;
 			}
+			*envs = env_vars;
+			return 0;
 		}
-		i++;
-		tmp_env = strtok(NULL, "\n");
+		DEBUG_PRINTF("Found env %s\n", rec);
+		env_vars[i++] = rec;
+		if (!*path_env && strncmp(rec, "PATH=", 5) == 0) {
+			DEBUG_PRINTF("Found PATH env %s\n", rec);
+			*path_env = rec;
+		}
 	}
-	// Special case where malloc did not return NULL with 0 size,
-	// or no strings with '\n' found after the first occurance of '\n'.
-	// Both cases mean that we have no environment variables and hence
-	// we should return NULL.
-	if (i == 0) {
-		// free is safe here, since env_vars come from malloc and
-		// contains either NULL or address. Both cases are fine for free.
-		free(env_vars);
-		return NULL;
-	}
-	// Add NULL to indicate the end of the table with environment variables.
-	env_vars[i] = NULL;
 
-	return env_vars;
+	fprintf(stderr, "Invalid format of environment variable list. \"UEE\" was not found\n");
+	free(env_vars);
+	return -1;
 }
 
 // get_uint_val: Converst the value of "KEY: VALUE" string  to uint32_t
@@ -431,77 +443,69 @@ int get_string_val(char *str, char **value) {
 	return -1;
 }
 
-// parse_process_config: Parses a list with the following format:
+// parse_process_config: Parses the process configuration with the following
+// records:
 // UCS
 // UID:<uid>
 // GID:<gid>
 // WD:<working directory>
-// ARC:<number of arguments>      (optional, followed by ARC lines of)
+// ARC:<number of arguments>      (optional, followed by ARC records of)
 // ARV:<argument>                 (taken verbatim)
 // UCE
-// It is important to note, that this function will alter the given list,
-// replacing the new line characters with the end of string '\0' character.
-// The funtion returns a dynamically allocated memory and the caller is
-// responsible to free that memory.
+// The "UCS" record is already consumed by the caller. The caller is
+// responsible to free the returned process_config.
 //
 // Arguments:
-// 1. string_area:	The list with in the aformentioned format.
-// 2. max_sz:		The max possible size of the list.
+// 1. iter:	The iterator over the configuration records. On success, it
+//		moves past the "UCE" record.
+// 2. pconf:	Will point to the parsed process configuration.
 //
 // Return value:
-// On success it returns a pointer to a dynamically allocated memory that
-// contains a process_config struct filled with the information
-// from the configuration.
-// Otherwise, NULL is returned
-struct process_config *parse_process_config(char **string_area, size_t max_sz) {
+// On success 0 is returned. Otherwise, -1 is returned.
+int parse_process_config(struct record_iter *iter, struct process_config **pconf) {
 	struct process_config *conf = NULL;
-	char *tmp_field = NULL;
+	char *rec = NULL;
 	uint32_t found_argv = 0;
 
 	conf = malloc(sizeof(struct process_config));
 	if (!conf) {
 		fprintf(stderr, "Failed to allocate memory for app execution environment config\n");
-		return NULL;
+		return -1;
 	}
 	memset(conf, 0, sizeof(struct process_config));
 	conf->wdir = NULL; // Sanity
 	conf->argv = NULL;
 	conf->argc = 0;
 
-	tmp_field = strtok(*string_area, "\n");
-	// Discard the first string since it is the special string "UCS"
-	// Also, it is safe to call strtok, even if there was no '\n', since it will
-	// return NULL again.
-	tmp_field = strtok(NULL, "\n");
-	while (tmp_field && ((size_t)(tmp_field - *string_area) < max_sz)) {
+	while ((rec = next_record(iter)) != NULL) {
 		int ret = 0;
 
-		if (memcmp(tmp_field, "UID:", 4) == 0) {
-			ret = get_uint_val(tmp_field, &(conf->uid));
+		if (is_field(rec, "UID")) {
+			ret = get_uint_val(rec, &(conf->uid));
 			if (ret != 0) {
-				fprintf(stderr, "Failed to retreive UID information from %s\n", tmp_field);
+				fprintf(stderr, "Failed to retreive UID information from %s\n", rec);
 				break;
 			}
-		} else 	if (memcmp(tmp_field, "GID", 3) == 0) {
-			ret = get_uint_val(tmp_field, &(conf->gid));
+		} else if (is_field(rec, "GID")) {
+			ret = get_uint_val(rec, &(conf->gid));
 			if (ret != 0) {
-				fprintf(stderr, "Failed to retreive GID information from %s\n", tmp_field);
+				fprintf(stderr, "Failed to retreive GID information from %s\n", rec);
 				break;
 			}
-		} else 	if (memcmp(tmp_field, "WD", 2) == 0) {
-			ret = get_string_val(tmp_field, &(conf->wdir));
+		} else if (is_field(rec, "WD")) {
+			ret = get_string_val(rec, &(conf->wdir));
 			if (ret != 0) {
-				fprintf(stderr, "Failed to retreive WD information from %s\n", tmp_field);
+				fprintf(stderr, "Failed to retreive WD information from %s\n", rec);
 				break;
 			}
-		} else if (memcmp(tmp_field, "ARC:", 4) == 0) {
+		} else if (is_field(rec, "ARC")) {
 			// Number of arguments of the application command. It
 			// must precede the ARV entries.
 			uint32_t argc = 0;
 
-			ret = get_uint_val(tmp_field, &argc);
+			ret = get_uint_val(rec, &argc);
 			if (ret != 0 || conf->argv != NULL) {
-				fprintf(stderr, "Failed to retrieve ARC information from %s\n", tmp_field);
+				fprintf(stderr, "Failed to retrieve ARC information from %s\n", rec);
 				break;
 			}
 			// Compute the element count in size_t. argc is uint32_t, so
@@ -516,60 +520,58 @@ struct process_config *parse_process_config(char **string_area, size_t max_sz) {
 			}
 			conf->argc = argc;
 			found_argv = 0;
-		} else if (memcmp(tmp_field, "ARV:", 4) == 0) {
+		} else if (is_field(rec, "ARV")) {
 			// One argument of the application command, taken verbatim
-			// (it may contain spaces or be empty).
+			// (it may contain spaces or new lines, or be empty).
 			if (conf->argv == NULL || found_argv >= conf->argc) {
-				fprintf(stderr, "Unexpected ARV entry %s\n", tmp_field);
+				fprintf(stderr, "Unexpected ARV entry %s\n", rec);
 				break;
 			}
-			// We keep any argument verbatim because anything can be
-			// an argument (except a new line which is not supported)
-			conf->argv[found_argv++] = tmp_field + 4;
-			DEBUG_PRINTF("Found argument %s\n", tmp_field + 4);
-		} else 	if (memcmp(tmp_field, "UCE", 3) == 0) {
+			conf->argv[found_argv++] = rec + 4;
+			DEBUG_PRINTF("Found argument %s\n", rec + 4);
+		} else if (strcmp(rec, "UCE") == 0) {
 			if (conf->argv != NULL && found_argv != conf->argc) {
 				fprintf(stderr, "Expected %u arguments, found %u\n", conf->argc, found_argv);
 				break;
 			}
-			*string_area = tmp_field + 4; // 4 bytes for the "UCE" string
-			return conf;
+			*pconf = conf;
+			return 0;
 		}
-
-		tmp_field = strtok(NULL, "\n");
 	}
 
+	if (!rec)
+		fprintf(stderr, "Invalid format of application execution environment configuration. \"UCE\" was not found\n");
 	free(conf->argv);
 	free(conf);
-	return NULL;
+	return -1;
 }
 
-// parse_net_config: Parses a list with the following format:
+// parse_net_config: Parses the network configuration with the following
+// records:
 // UNS
 // IP:<ipv4 address>
 // GW:<gateway>
 // MSK:<netmask>
 // UNE
 // It is used by guests that can not get the network configuration from the
-// kernel command line (e.g. FreeBSD). It alters the given list, replacing the
-// new line characters with '\0'. The caller is responsible to free the
-// returned memory.
+// kernel command line (e.g. FreeBSD). The "UNS" record is already consumed by
+// the caller. The caller is responsible to free the returned net_config.
 //
 // Arguments:
-// 1. string_area:	The list with in the aformentioned format.
-// 2. max_sz:		The max possible size of the list.
+// 1. iter:	The iterator over the configuration records. On success, it
+//		moves past the "UNE" record.
+// 2. nconf:	Will point to the parsed network configuration.
 //
 // Return value:
-// On success it returns a pointer to a dynamically allocated net_config.
-// Otherwise, NULL is returned
-struct net_config *parse_net_config(char **string_area, size_t max_sz) {
+// On success 0 is returned. Otherwise, -1 is returned.
+int parse_net_config(struct record_iter *iter, struct net_config **nconf) {
 	struct net_config *conf = NULL;
-	char *tmp_field = NULL;
+	char *rec = NULL;
 
 	conf = malloc(sizeof(struct net_config));
 	if (!conf) {
 		fprintf(stderr, "Failed to allocate memory for network config\n");
-		return NULL;
+		return -1;
 	}
 	memset(conf, 0, sizeof(struct net_config));
 	// just for snaity
@@ -577,176 +579,158 @@ struct net_config *parse_net_config(char **string_area, size_t max_sz) {
 	conf->gateway = NULL;
 	conf->mask = NULL;
 
-	tmp_field = strtok(*string_area, "\n");
-	// Discard the first string since it is the special string "UNS"
-	tmp_field = strtok(NULL, "\n");
-	while (tmp_field && ((size_t)(tmp_field - *string_area) < max_sz)) {
+	while ((rec = next_record(iter)) != NULL) {
 		int ret = 0;
 
 		// An empty value (e.g. "IP:") means the field is not set.
-		if (memcmp(tmp_field, "IP:", 3) == 0) {
-			ret = get_string_val(tmp_field, &(conf->ip));
+		if (is_field(rec, "IP")) {
+			ret = get_string_val(rec, &(conf->ip));
 			if (ret != 0) {
 				conf->ip = NULL;
-				fprintf(stderr, "Failed to retreive IP information from %s\n", tmp_field);
+				fprintf(stderr, "Failed to retreive IP information from %s\n", rec);
 			}
-		} else if (memcmp(tmp_field, "GW:", 3) == 0) {
-			ret = get_string_val(tmp_field, &(conf->gateway));
+		} else if (is_field(rec, "GW")) {
+			ret = get_string_val(rec, &(conf->gateway));
 			if (ret != 0) {
 				conf->gateway = NULL;
-				fprintf(stderr, "Failed to retreive GW information from %s\n", tmp_field);
+				fprintf(stderr, "Failed to retreive GW information from %s\n", rec);
 			}
-		} else if (memcmp(tmp_field, "MSK:", 4) == 0) {
-			ret = get_string_val(tmp_field, &(conf->mask));
+		} else if (is_field(rec, "MSK")) {
+			ret = get_string_val(rec, &(conf->mask));
 			if (ret != 0) {
 				conf->mask = NULL;
-				fprintf(stderr, "Failed to retreive MSK information from %s\n", tmp_field);
+				fprintf(stderr, "Failed to retreive MSK information from %s\n", rec);
 			}
-		} else if (memcmp(tmp_field, "UNE", 3) == 0) {
-			*string_area = tmp_field + 4; // 4 bytes for the "UNE" string
+		} else if (strcmp(rec, "UNE") == 0) {
 			DEBUG_PRINTF("Found network config ip=%s gw=%s mask=%s\n",
 				     conf->ip ? conf->ip : "", conf->gateway ? conf->gateway : "",
 				     conf->mask ? conf->mask : "");
-			return conf;
+			*nconf = conf;
+			return 0;
 		}
-
-		tmp_field = strtok(NULL, "\n");
 	}
 
+	fprintf(stderr, "Invalid format of network configuration. \"UNE\" was not found\n");
 	free(conf);
-	return NULL;
+	return -1;
 }
 
-// parse_block_config Parses a list with the following format:
-// UBS
-// ID: <serial_id>
-// MP: <mount_point>
-// ...
-// UBE
-// It is important to note, that this function will alter the given list,
-// replacing the new line characters with the end of string '\0' character.
-// The funtion returns a dynamically allocated memory and the caller is
-// responsible to free that memory.
+// free_block_config: Frees a NULL terminated array of block_config entries.
 //
 // Arguments:
-// 1. string_area:	The list with the aformentioned format.
-// 2. max_sz:		The maximum size of the area to look for block config
+// 1. bentries:	The array to free. It can be NULL.
+void free_block_config(struct block_config **bentries) {
+	if (!bentries)
+		return;
+	for (size_t i = 0; bentries[i] != NULL; i++)
+		free(bentries[i]);
+	free(bentries);
+}
+
+// parse_block_config: Parses the block mount configuration with the following
+// records:
+// UBS
+// ID:<serial_id>
+// MP:<mount_point>
+// ...
+// UBE
+// The "UBS" record is already consumed by the caller. The caller is
+// responsible to free the returned array with free_block_config.
+//
+// Arguments:
+// 1. iter:	The iterator over the configuration records. On success, it
+//		moves past the "UBE" record.
+// 2. bconf:	Will point to a NULL terminated array of block_config entries,
+//		or NULL if there are no block entries.
 //
 // Return value:
-// On success it returns an array of block_config structs filled with the information
-// from the list.
-// Otherwise, NULL is returned
-struct block_config **parse_block_config(char **string_area, size_t max_sz) {
-	// TODO: We might need to retrun a list here with the first
-	// element being NULL instead of returning NULL
+// On success 0 is returned. Otherwise, -1 is returned.
+int parse_block_config(struct record_iter *iter, struct block_config ***bconf) {
 	struct block_config **bentries = NULL;
-	char *tmp_field = NULL;
-	size_t i = 0;
+	struct block_config *cur = NULL;
+	char *rec = NULL;
 	size_t total_entries = 0;
+	size_t i = 0;
 
-	// Count the new line characters we have in the list.
-	// Since every block entry consist of 2 fields, the total number
-	// of entries derives from diving the number of new lines by 2.
-	total_entries = measure_tokens(*string_area, max_sz, '\n') / 2;
-	// If the list is correctly formatted it will start with "UBS"
-	// and end with "UBE". These special strings will not be stored,
-	// but they add up in the overall size, since they occupy one line each.
-	// However, we can use this extra entry in the array to mark the end of
-	// the array with NULL.
-	bentries = malloc(total_entries * sizeof(struct block_config *));
+	// Every entry consists of two records (ID and MP), so the number of
+	// records is more than enough. The extra pointer marks the end of the
+	// array with NULL, which calloc already sets.
+	total_entries = count_records(*iter, "UBE");
+	bentries = calloc(total_entries + 1, sizeof(struct block_config *));
 	if (!bentries) {
 		fprintf(stderr, "Failed to allocate memory for block entries\n");
-		return NULL;
+		return -1;
 	}
-	if (total_entries > 0)
-		bentries[0] = NULL;
-	DEBUG_PRINTF("Found %ld block entries\n", total_entries);
 
-	tmp_field = strtok(*string_area, "\n");
-	// Discard the first string since it is the special string "UBS"
-	// Also, it is safe to call strtok, even if there was no '\n', since it will
-	// return NULL again.
-	tmp_field = strtok(NULL, "\n");
-	while (tmp_field && i < total_entries) {
+	while ((rec = next_record(iter)) != NULL) {
 		int ret = 0;
 
-		// The first string should be "ID:"
-		if (memcmp(tmp_field, "ID:", 3) == 0) {
-			// If bentries[i] is not NULL then we never reached found
-			// MP entry in the config for this ID.
-			if (bentries[i]) {
+		if (is_field(rec, "ID")) {
+			// If cur is not NULL, then we never found the MP
+			// entry for the previous ID.
+			if (cur) {
 				fprintf(stderr, "Multiple ID entries without MP\n");
 				goto parse_block_config_free;
 			}
-			bentries[i] = malloc(sizeof(struct block_config));
-			if (!bentries[i]) {
+			cur = malloc(sizeof(struct block_config));
+			if (!cur) {
 				fprintf(stderr, "Failed to allocate memory for a block entry\n");
 				goto parse_block_config_free;
 			}
-			bentries[i]->id = NULL;
-			bentries[i]->mountpoint = NULL;
+			cur->id = NULL;
+			cur->mountpoint = NULL;
 
-			ret = get_string_val(tmp_field, &(bentries[i]->id));
+			ret = get_string_val(rec, &(cur->id));
 			if (ret != 0) {
-				fprintf(stderr, "Failed to retrieve block ID from %s\n", tmp_field);
-				free(bentries[i]);
+				fprintf(stderr, "Failed to retrieve block ID from %s\n", rec);
 				goto parse_block_config_free;
 			}
-			DEBUG_PRINTF("Found block entry with ID %s\n", bentries[i]->id);
-		} else if (memcmp(tmp_field, "MP:", 3) == 0) {
-			ret = get_string_val(tmp_field, &(bentries[i]->mountpoint));
-			if (ret != 0) {
-				fprintf(stderr, "Failed to retrieve block mountpoint from %s\n", tmp_field);
-				// Remove the current entry
-				// because it was not properly formatted.
-				free(bentries[i]);
+			DEBUG_PRINTF("Found block entry with ID %s\n", cur->id);
+		} else if (is_field(rec, "MP")) {
+			if (!cur) {
+				fprintf(stderr, "Found MP entry without ID: %s\n", rec);
 				goto parse_block_config_free;
 			}
-			DEBUG_PRINTF("Found block entry with MP %s\n", bentries[i]->mountpoint);
-			i++;
-			bentries[i] = NULL;
-		} else 	if (memcmp(tmp_field, "UBE", 3) == 0) {
-			// 4 bytes for the "UBE" string
-			*string_area = tmp_field + 4;
-			break;
+			ret = get_string_val(rec, &(cur->mountpoint));
+			if (ret != 0) {
+				fprintf(stderr, "Failed to retrieve block mountpoint from %s\n", rec);
+				goto parse_block_config_free;
+			}
+			DEBUG_PRINTF("Found block entry with MP %s\n", cur->mountpoint);
+			bentries[i++] = cur;
+			cur = NULL;
+		} else if (strcmp(rec, "UBE") == 0) {
+			// An ID without MP is not a complete entry, so drop it.
+			if (cur) {
+				fprintf(stderr, "Warning: Ignoring block entry %s without MP\n", cur->id);
+				free(cur);
+			}
+			if (i == 0) {
+				free(bentries);
+				bentries = NULL;
+			}
+			*bconf = bentries;
+			return 0;
 		}
-		tmp_field = strtok(NULL, "\n");
 	}
 
-	// Special case where malloc did not return NULL with 0 size,
-	// or none properly formatted block entries were found
-	// Both cases mean that we have no block entries and hence
-	// we should return NULL.
-	if (i == 0) {
-		// free is safe here, since bentries come from malloc and
-		// contains either NULL or an address. Both cases are fine for free.
-		free(bentries);
-		return NULL;
-	}
-	// In case of a malformed block config where we had an ID but no MP,
-	// then mountpoint will be NULL and we should free the allocated entry.
-	if (bentries[i] && !(bentries[i]->mountpoint)) {
-		free(bentries[i]);
-	}
-	// Add NULL to indicate the end of the table with block entries
-	bentries[i] = NULL;
-
-	return bentries;
-
+	fprintf(stderr, "Invalid format of block volume mounts. \"UBE\" was not found\n");
 parse_block_config_free:
-	for (size_t j = 0; j < i; j++) {
-		free(bentries[j]);
-	}
-	free(bentries);
-
-	return NULL;
+	free(cur);
+	free_block_config(bentries);
+	return -1;
 }
 
-// get_config_from_file: Reads the contents of <file> argumen and it parses the 
-// app execution configuration and environment variables list.
-// The app execution configuration list starts with the line "UCS" and ends with the
-// line "UCE". Respectively, the environment variable list, starts with the "UES" line
-// and ends with the line "UES".
+// get_config_from_file: Reads the contents of <file> and parses the
+// configuration of the application. The configuration consists of the
+// following optional sections:
+// - The environment variable list, between the "UES" and "UEE" records.
+// - The process configuration, between the "UCS" and "UCE" records.
+// - The block mount configuration, between the "UBS" and "UBE" records.
+// - The network configuration, between the "UNS" and "UNE" records.
+// A "PAD" record ends the configuration and everything after it is ignored.
+// The records are NUL-terminated strings after the CONFIG_MAGIC record or, in
+// the legacy format, lines.
 //
 // Arguments:
 // 1. file:	The name of the file that contains the configuration.
@@ -756,7 +740,7 @@ parse_block_config_free:
 //
 // Return value:
 // On success it returns a pointer to an instance of a struct app_exec_config
-// ehich contains all the respective information for setting app the execution
+// which contains all the respective information for setting up the execution
 // environment of the application.
 struct app_exec_config *get_config_from_file(char *file, char **sbuf) {
 	char **env_vars = NULL;
@@ -767,99 +751,69 @@ struct app_exec_config *get_config_from_file(char *file, char **sbuf) {
 	struct process_config *pconf = NULL;
 	struct block_config **bconf = NULL;
 	struct net_config *nconf = NULL;
-	char *conf_area = NULL;
+	struct record_iter iter = { 0 };
+	char *rec = NULL;
+	uint8_t found_envs = 0;
+	uint8_t found_pconf = 0;
+	uint8_t found_bconf = 0;
+	uint8_t found_nconf = 0;
 
 	buf = read_file_and_size(file, &size);
 	if (!buf) {
 		fprintf(stderr, "Could not read file %s\n", file);
 		return NULL;
 	}
-	conf_area = buf;
+	iter.pos = buf;
+	iter.end = buf + size;
 
-	DEBUG_PRINT("Checking for environment variables list\n");
-	// Check if the special string "UES" is present
-	// which means that now starts the environment variable
-	// list.
-	if (size >= 3 && memcmp(conf_area, "UES", 3) == 0) {
-		char *init_conf_area = conf_area;
-		// Extract the environment variables from the list
-		env_vars = parse_envs(&conf_area, size, &path_env);
-		if (!env_vars ) {
-			fprintf(stderr, "Warning: No environment variables found in the configuration\n");
+	if (size >= sizeof(CONFIG_MAGIC) && memcmp(buf, CONFIG_MAGIC, sizeof(CONFIG_MAGIC)) == 0) {
+		DEBUG_PRINT("Configuration with NUL-terminated records\n");
+		iter.pos += sizeof(CONFIG_MAGIC);
+	} else {
+		DEBUG_PRINT("Configuration with new line separated records (legacy)\n");
+		// Turn the new lines to NUL, so both formats get parsed the
+		// same way. Values with new lines can not be stored in the
+		// legacy format anyway.
+		for (size_t i = 0; i < size; i++) {
+			if (buf[i] == '\n')
+				buf[i] = '\0';
 		}
-		// If the list was properly formatted, ending with "UEE"
-		// then string_area should differ from init_string_area
-		// Otherwise, the list was not properly formatted and
-		// we abort the parsing.
-		if (conf_area == init_conf_area) {
-			fprintf(stderr, "Invalid format of environment variable list. \"UEE\" was not found\n");
-			goto get_env_vars_error_free;
-		}
-		// Reduce the size of the config by the bytes parsed
-		// for the environment variables list.
-		size -= conf_area - init_conf_area;
 	}
 
-	DEBUG_PRINT("Checking for execution environment configuration\n");
-	// Check if the special string "UCS" is present
-	// which means that now starts the configuration for the application
-	// execution environment
-	if (size >= 3 && memcmp(conf_area, "UCS", 3) == 0) {
-		char *init_conf_area = conf_area;
-		// Extract the environment variables from the list
-		pconf = parse_process_config(&conf_area, size);
-		if (!pconf ) {
-			fprintf(stderr, "Warning: No configuration for the application execution environment was found\n");
-		}
-		// If the list was properly formatted, ending with "UCE"
-		// then string_area should differ from init_string_area
-		// Otherwise, the list was not properly formatted and
-		// we abort the parsing.
-		if (conf_area == init_conf_area) {
-			fprintf(stderr, "Invalid format of application execution environment configuration\n");
-			goto get_env_vars_error_free;
-		}
-		// Reduce the size of the config by the bytes parsed
-		// for the environment variables list.
-		size -= conf_area - init_conf_area;
-	}
+	while ((rec = next_record(&iter)) != NULL) {
+		int ret = 0;
 
-	DEBUG_PRINT("Checking for block volumes mount configuration\n");
-	// Check if the special string "UBS" is present
-	// which means that now starts the configuration for the block mounts
-	if (size >= 3 && memcmp(conf_area, "UBS", 3) == 0) {
-		char *init_conf_area = conf_area;
-		// Extract the block configuration
-		bconf = parse_block_config(&conf_area, size);
-		if (!bconf ) {
-			fprintf(stderr, "Warning: No configuration for block mounts\n");
+		if (strcmp(rec, "UES") == 0 && !found_envs) {
+			DEBUG_PRINT("Checking for environment variables list\n");
+			found_envs = 1;
+			ret = parse_envs(&iter, &env_vars, &path_env);
+			if (ret == 0 && !env_vars)
+				fprintf(stderr, "Warning: No environment variables found in the configuration\n");
+		} else if (strcmp(rec, "UCS") == 0 && !found_pconf) {
+			DEBUG_PRINT("Checking for execution environment configuration\n");
+			found_pconf = 1;
+			ret = parse_process_config(&iter, &pconf);
+		} else if (strcmp(rec, "UBS") == 0 && !found_bconf) {
+			DEBUG_PRINT("Checking for block volumes mount configuration\n");
+			found_bconf = 1;
+			ret = parse_block_config(&iter, &bconf);
+			if (ret == 0 && !bconf)
+				fprintf(stderr, "Warning: No configuration for block mounts\n");
+		} else if (strcmp(rec, "UNS") == 0 && !found_nconf) {
+			DEBUG_PRINT("Checking for network configuration\n");
+			found_nconf = 1;
+			ret = parse_net_config(&iter, &nconf);
+		} else if (strcmp(rec, "PAD") == 0) {
+			// Everything after PAD is padding (e.g. up to the sector
+			// size of a raw block device), not configuration.
+			DEBUG_PRINT("Found padding, end of configuration\n");
+			break;
+		} else {
+			fprintf(stderr, "Unexpected record in the configuration: %s\n", rec);
+			ret = -1;
 		}
-		// If the list was properly formatted, ending with "UBE"
-		// then conf_area should differ from init_conf_area
-		// Otherwise, the list was not properly formatted and
-		// we abort the parsing.
-		if (conf_area == init_conf_area) {
-			fprintf(stderr, "Invalid format of block volume mounts\n");
+		if (ret != 0)
 			goto get_env_vars_error_free;
-		}
-		size -= conf_area - init_conf_area;
-	}
-
-	DEBUG_PRINT("Checking for network configuration\n");
-	// Check if the special string "UNS" is present
-	// which means that now starts the network configuration
-	if (size >= 3 && memcmp(conf_area, "UNS", 3) == 0) {
-		char *init_conf_area = conf_area;
-
-		nconf = parse_net_config(&conf_area, size);
-		if (!nconf) {
-			fprintf(stderr, "Warning: No network configuration was found\n");
-		}
-		if (conf_area == init_conf_area) {
-			fprintf(stderr, "Invalid format of network configuration\n");
-			goto get_env_vars_error_free;
-		}
-		size -= conf_area - init_conf_area;
 	}
 
 	econf = malloc(sizeof(struct app_exec_config));
@@ -881,6 +835,7 @@ get_env_vars_error_free:
 	if (pconf)
 		free(pconf->argv);
 	free(pconf);
+	free_block_config(bconf);
 	free(nconf);
 	free(buf);
 	return NULL;
@@ -1199,6 +1154,7 @@ child_func_free:
 		if (app_config->pr_conf)
 			free(app_config->pr_conf->argv);
 		free(app_config->pr_conf);
+		free_block_config(app_config->blk_conf);
 		free(app_config->net_conf);
 		free(app_config);
 	}

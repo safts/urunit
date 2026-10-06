@@ -80,9 +80,27 @@ following information:
 The file can be specified to `urunit` setting the `URUNIT_CONFIG`
 environment variable with the path to the configuration file.
 
-The supported format of the configuration file is the following:
+The configuration file consists of records. Every record is a NUL-terminated
+string (`\0`) and the file begins with the `URUNIT1` record. Since neither
+environment variables nor arguments can contain a NUL character, every value is
+stored verbatim, even if it contains new lines (e.g. a certificate). For
+example:
 
 ```
+printf 'URUNIT1\0UES\0PATH=/bin\0CERT=line1\nline2\0UEE\0' > urunit.conf
+```
+
+Empty records are ignored, so the file can be padded with zeros (e.g. when it is
+exposed as a raw block device). A `PAD` record also ends the configuration and
+anything after it is ignored. Section markers (`UES`, `UEE`, ...) must match
+the whole record and fields must match the whole key, including `:`. Hence, an
+environment variable such as `UEE_MODE=1` does not end the list.
+
+The supported records of the configuration file are the following, one per
+line for readability:
+
+```
+URUNIT1
 UES
 /* list of environment variables */
 UEE
@@ -115,6 +133,12 @@ The `UNS` section is optional and provides the network configuration for
 guests that can not get it from the kernel command line: `IP` is the IPv4
 address, `GW` the gateway and `MSK` the netmask. An empty value (e.g. `IP:`)
 leaves the field unset.
+
+#### Legacy format
+
+A configuration file that does not begin with the `URUNIT1` record is parsed in
+the legacy format, where every record is a line instead. It is still supported
+for compatibility, but it can not store values that contain new lines.
 
 ## Installation
 
