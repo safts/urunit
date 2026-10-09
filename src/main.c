@@ -64,6 +64,10 @@
 // The pid of the agent urunit started, 0 when there is none or it was reaped.
 static pid_t agent_pid = 0;
 
+// The file urunit records the app's exit status in for the runtime, opened at
+// start when URUNIT_EXIT_STATUS names it; -1 when there is none.
+static int exit_status_fd = -1;
+
 struct process_config {
 	uint32_t uid;
 	uint32_t gid;
@@ -1346,6 +1350,52 @@ void stop_agent() {
 	}
 }
 
+// open_exit_status: Opens (and truncates) the file named by
+// URUNIT_EXIT_STATUS, before anything else can mount over its directory.
+// Failures are reported and ignored.
+void open_exit_status(void) {
+	char *path = getenv("URUNIT_EXIT_STATUS");
+	uint8_t free_boot_var = 0;
+
+	if (!path) {
+		path = get_boot_var("URUNIT_EXIT_STATUS");
+		free_boot_var = 1;
+	}
+	if (!path) {
+		return;
+	}
+	exit_status_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (exit_status_fd < 0) {
+		perror("open exit status file");
+	}
+	if (free_boot_var) {
+		free(path);
+	}
+}
+
+// record_exit_status: Writes one line, EXIT:<n> or SIGNAL:<n>, describing how
+// the app terminated, to the exit status file, if one was opened.
+void record_exit_status(int wstatus) {
+	int ret = 0;
+
+	if (exit_status_fd < 0) {
+		return;
+	}
+	if (WIFEXITED(wstatus)) {
+		ret = dprintf(exit_status_fd, "EXIT:%d\n", WEXITSTATUS(wstatus));
+	} else if (WIFSIGNALED(wstatus)) {
+		ret = dprintf(exit_status_fd, "SIGNAL:%d\n", WTERMSIG(wstatus));
+	}
+	if (ret < 0) {
+		perror("write exit status");
+	}
+	if (fsync(exit_status_fd) < 0) {
+		perror("fsync exit status");
+	}
+	close(exit_status_fd);
+	exit_status_fd = -1;
+}
+
 int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 	pid_t reaped_pid = 0;
 	int reaped_status = 0;
@@ -1385,6 +1435,8 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 
 				// Be safe, ensure the status code is indeed between 0 and 255.
 				*child_exitcode_ptr = *child_exitcode_ptr % (STATUS_MAX - STATUS_MIN + 1);
+
+				record_exit_status(reaped_status);
 
 				// The app is done. The agent urunit started would
 				// otherwise run forever, so ask it to exit; it is
@@ -1443,6 +1495,8 @@ int main(int argc, char *argv[]) {
 		perror("Become subreaper");
 		return 1;
 	}
+
+	open_exit_status();
 
 	// The agent is started before the app, as urunit's own child, so that
 	// urunit reaps it too.

@@ -21,6 +21,13 @@ The key features of `urunit` are:
   child before the application (e.g. the `urunc exec` agent) and reaping it.
   Once the application exits the agent is sent `SIGTERM`, and `urunit` waits,
   as always, for every remaining child before shutting down.
+- Recording the application's exit status for the runtime, if
+  `URUNIT_EXIT_STATUS` is set to an absolute path (environment or boot
+  parameter). The file is opened and truncated at start, before the agent and
+  the application are spawned, and once the application is reaped `urunit`
+  writes one line to it, `EXIT:<n>` (exit status 0-255) or `SIGNAL:<n>` (the
+  terminating signal), and syncs it before shutting down. A missing, empty or
+  unparsable file means no status was recorded.
 
 ## Building
 
