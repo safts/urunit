@@ -461,6 +461,21 @@ int mount_block_vols(struct block_config **vols) {
 	return 0;
 }
 
+// mount_tmpfs_vols: tmpfs mounts from the configuration are not supported
+// on FreeBSD; they are reported and ignored.
+//
+// Arguments:
+// 1. vols:	An array of struct tmpfs_config. It can be NULL.
+//
+// Return value:
+// 0 is returned.
+int mount_tmpfs_vols(struct tmpfs_config *vols) {
+	if (vols != NULL)
+		fprintf(stderr, "tmpfs mounts are not supported on this platform\n");
+
+	return 0;
+}
+
 #define RT_ROUNDUP(a) \
 	((a) > 0 ? (1 + (((a) - 1) | (sizeof(long) - 1))) : sizeof(long))
 

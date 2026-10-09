@@ -128,6 +128,12 @@ ID: <serial_id>
 MP: <mountpoint>
 ...
 UBE
+UTS
+MP:  <mountpoint>
+FL:  <mount_flags>
+DAT: <tmpfs_data>
+...
+UTE
 UNS
 IP:  <ipv4_address>
 GW:  <gateway>
@@ -139,6 +145,14 @@ Inside the `UCS` section, the application command is optional: `ARC` holds the
 number of arguments and is followed by exactly that many `ARV` lines, one per
 argument, each taken verbatim. It is used when `urunit` is started without a
 command line, in which case the command from the configuration is executed.
+
+The `UTS` section is optional and lists tmpfs mounts that `urunit` creates
+inside the guest before it starts the application. Every entry begins with `MP`,
+an absolute path that is created if it does not exist. `FL` holds the mount
+flags as the decimal value of the Linux mount(2) `MS_*` bits (e.g. `14` for
+`nosuid,nodev,noexec`) and `DAT` the tmpfs data (e.g. `size=64m,mode=1770`),
+taken verbatim and possibly empty. Both apply to the last `MP` and default to
+`0` and empty. tmpfs mounts are not supported on FreeBSD.
 
 The `UNS` section is optional and provides the network configuration for
 guests that can not get it from the kernel command line: `IP` is the IPv4

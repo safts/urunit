@@ -41,6 +41,13 @@ struct block_config {
 	char *mountpoint;
 };
 
+// A tmpfs mount; arrays of it end with an entry whose mountpoint is NULL.
+struct tmpfs_config {
+	char *mountpoint;
+	uint32_t flags;
+	char *data;
+};
+
 struct net_config {
 	char *ip;
 	char *gateway;
@@ -66,6 +73,7 @@ int find_vblock_device_by_order(const uint32_t n, char *device_path);
 int find_vblock_device_by_serial(const char *target_serial, char *device_path);
 int mount_special_fs(void);
 int mount_block_vols(struct block_config **vols);
+int mount_tmpfs_vols(struct tmpfs_config *vols);
 int set_default_route(void);
 void unmount_external(void);
 int set_subreaper(void);
