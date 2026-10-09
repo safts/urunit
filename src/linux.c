@@ -256,6 +256,45 @@ int mount_block_vols(struct block_config **vols) {
 	return 0;
 }
 
+// mount_tmpfs_vols: Mounts a tmpfs at every entry of the tmpfs_config array,
+// with the given mount(2) flags and data. A failed entry is reported and
+// skipped.
+//
+// Arguments:
+// 1. vols:	An array of struct tmpfs_config, terminated by an entry with a
+//		NULL mountpoint. It can be NULL.
+//
+// Return value:
+// 0 is returned.
+int mount_tmpfs_vols(struct tmpfs_config *vols) {
+	char first_new_dir[PATH_MAX] = { 0 };
+
+	if (vols == NULL) {
+		DEBUG_PRINT("No tmpfs volumes to mount, nothing to do\n");
+		return 0;
+	}
+
+	for (struct tmpfs_config *t = vols; t->mountpoint != NULL; t++) {
+		if (t->mountpoint[0] != '/') {
+			fprintf(stderr, "Skipping tmpfs mount at non absolute path %s\n", t->mountpoint);
+			continue;
+		}
+		first_new_dir[0] = '\0';
+		DEBUG_PRINTF("Mount tmpfs at %s with flags %u and data %s\n", t->mountpoint, t->flags, t->data);
+		if (mkdir_all(t->mountpoint, 0755, first_new_dir) != 0) {
+			fprintf(stderr, "Failed to create %s\n", t->mountpoint);
+			continue;
+		}
+		if (mount("tmpfs", t->mountpoint, "tmpfs", (unsigned long)t->flags, t->data) != 0) {
+			fprintf(stderr, "mount tmpfs at %s: %s\n", t->mountpoint, strerror(errno));
+			if (first_new_dir[0] != '\0' && rm_empty_dirs(t->mountpoint, first_new_dir) < 0)
+				fprintf(stderr, "WARNING: Could not remove %s and its subdirs\n", t->mountpoint);
+		}
+	}
+
+	return 0;
+}
+
 // set_default_route: Sets the default network route to eth0.
 //
 // Arguments:

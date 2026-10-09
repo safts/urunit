@@ -81,6 +81,7 @@ struct app_exec_config {
 	char	 *path_env;
 	struct process_config *pr_conf;
 	struct block_config **blk_conf;
+	struct tmpfs_config *tmpfs_conf;
 	struct net_config *net_conf;
 };
 
@@ -734,12 +735,84 @@ parse_block_config_free:
 	return -1;
 }
 
+// parse_tmpfs_config: Parses the tmpfs mount configuration with the following
+// records:
+// UTS
+// MP:<mount_point>
+// FL:<mount flags>		(decimal mount(2) flags)
+// DAT:<data>			(taken verbatim, may be empty)
+// ...
+// UTE
+// FL and DAT apply to the last MP. Unknown records are ignored. The "UTS"
+// record is already consumed by the caller. The caller is responsible to free
+// the returned array.
+//
+// Arguments:
+// 1. iter:	The iterator over the configuration records. On success, it
+//		moves past the "UTE" record.
+// 2. tconf:	Will point to an array of tmpfs_config entries, terminated by
+//		an entry with a NULL mountpoint, or NULL if there are no entries.
+//
+// Return value:
+// On success 0 is returned. Otherwise, -1 is returned.
+int parse_tmpfs_config(struct record_iter *iter, struct tmpfs_config **tconf) {
+	struct tmpfs_config *tentries = NULL;
+	struct tmpfs_config *cur = NULL;
+	char *rec = NULL;
+	size_t i = 0;
+
+	// The number of records is more than enough for the entries, plus one
+	// zeroed entry that marks the end of the array.
+	tentries = calloc(count_records(*iter, "UTE") + 1, sizeof(struct tmpfs_config));
+	if (!tentries) {
+		fprintf(stderr, "Failed to allocate memory for tmpfs entries\n");
+		return -1;
+	}
+
+	while ((rec = next_record(iter)) != NULL) {
+		if (is_field(rec, "MP")) {
+			cur = &tentries[i];
+			if (get_string_val(rec, &(cur->mountpoint)) != 0) {
+				fprintf(stderr, "Failed to retrieve tmpfs mountpoint from %s\n", rec);
+				goto parse_tmpfs_config_free;
+			}
+			cur->data = "";
+			i++;
+			DEBUG_PRINTF("Found tmpfs entry with MP %s\n", cur->mountpoint);
+		} else if (is_field(rec, "FL") || is_field(rec, "DAT")) {
+			if (!cur) {
+				fprintf(stderr, "Found %s before any MP entry\n", rec);
+				goto parse_tmpfs_config_free;
+			}
+			if (is_field(rec, "DAT")) {
+				cur->data = rec + 4;
+			} else if (get_uint_val(rec, &(cur->flags)) != 0) {
+				fprintf(stderr, "Failed to retrieve tmpfs flags from %s\n", rec);
+				goto parse_tmpfs_config_free;
+			}
+		} else if (strcmp(rec, "UTE") == 0) {
+			if (i == 0) {
+				free(tentries);
+				tentries = NULL;
+			}
+			*tconf = tentries;
+			return 0;
+		}
+	}
+
+	fprintf(stderr, "Invalid format of tmpfs mounts. \"UTE\" was not found\n");
+parse_tmpfs_config_free:
+	free(tentries);
+	return -1;
+}
+
 // get_config_from_file: Reads the contents of <file> and parses the
 // configuration of the application. The configuration consists of the
 // following optional sections:
 // - The environment variable list, between the "UES" and "UEE" records.
 // - The process configuration, between the "UCS" and "UCE" records.
 // - The block mount configuration, between the "UBS" and "UBE" records.
+// - The tmpfs mount configuration, between the "UTS" and "UTE" records.
 // - The network configuration, between the "UNS" and "UNE" records.
 // A "PAD" record ends the configuration and everything after it is ignored.
 // The records are NUL-terminated strings after the CONFIG_MAGIC record or, in
@@ -763,12 +836,14 @@ struct app_exec_config *get_config_from_file(char *file, char **sbuf) {
 	struct app_exec_config *econf = NULL;
 	struct process_config *pconf = NULL;
 	struct block_config **bconf = NULL;
+	struct tmpfs_config *tconf = NULL;
 	struct net_config *nconf = NULL;
 	struct record_iter iter = { 0 };
 	char *rec = NULL;
 	uint8_t found_envs = 0;
 	uint8_t found_pconf = 0;
 	uint8_t found_bconf = 0;
+	uint8_t found_tconf = 0;
 	uint8_t found_nconf = 0;
 
 	buf = read_file_and_size(file, &size);
@@ -812,6 +887,10 @@ struct app_exec_config *get_config_from_file(char *file, char **sbuf) {
 			ret = parse_block_config(&iter, &bconf);
 			if (ret == 0 && !bconf)
 				fprintf(stderr, "Warning: No configuration for block mounts\n");
+		} else if (strcmp(rec, "UTS") == 0 && !found_tconf) {
+			DEBUG_PRINT("Checking for tmpfs mount configuration\n");
+			found_tconf = 1;
+			ret = parse_tmpfs_config(&iter, &tconf);
 		} else if (strcmp(rec, "UNS") == 0 && !found_nconf) {
 			DEBUG_PRINT("Checking for network configuration\n");
 			found_nconf = 1;
@@ -840,6 +919,7 @@ struct app_exec_config *get_config_from_file(char *file, char **sbuf) {
 	econf->path_env = path_env;
 	econf->pr_conf = pconf;
 	econf->blk_conf = bconf;
+	econf->tmpfs_conf = tconf;
 	econf->net_conf = nconf;
 	return econf;
 
@@ -849,6 +929,7 @@ get_env_vars_error_free:
 		free(pconf->argv);
 	free(pconf);
 	free_block_config(bconf);
+	free(tconf);
 	free(nconf);
 	free(buf);
 	return NULL;
@@ -1150,6 +1231,11 @@ int child_func(int argc, char *argv[]) {
 			fprintf(stderr, "Failed to mount block volumes\n");
 			goto child_func_free;
 		}
+		ret = mount_tmpfs_vols(app_config->tmpfs_conf);
+		if (ret != 0) {
+			fprintf(stderr, "Failed to mount tmpfs volumes\n");
+			goto child_func_free;
+		}
 		ret = setup_exec_env(app_config->pr_conf);
 		if (ret != 0) {
 			fprintf(stderr, "Failed to set up the process execution environment\n");
@@ -1168,6 +1254,7 @@ child_func_free:
 			free(app_config->pr_conf->argv);
 		free(app_config->pr_conf);
 		free_block_config(app_config->blk_conf);
+		free(app_config->tmpfs_conf);
 		free(app_config->net_conf);
 		free(app_config);
 	}
@@ -1299,6 +1386,8 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 // reaping loop like every other child; its exit does not end the guest, and
 // it is asked to exit (SIGTERM) once the application has exited. A failure to
 // start it is reported and does not prevent the application from starting.
+// It returns only once the agent has exec'd (or failed to), so that a mount
+// the application child makes (e.g. a tmpfs over /run) can not race the exec.
 //
 // Arguments:
 // No arguments.
@@ -1308,6 +1397,8 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 void spawn_agent() {
 	char *agent_argv[] = { URUNIT_AGENT_PATH, NULL };
 	pid_t pid;
+	int p[2];
+	char c;
 
 	if (access(URUNIT_AGENT_PATH, X_OK) != 0) {
 		DEBUG_PRINTF("No agent at %s, nothing to start\n", URUNIT_AGENT_PATH);
@@ -1315,11 +1406,21 @@ void spawn_agent() {
 	}
 
 	DEBUG_PRINTF("Starting agent %s\n", URUNIT_AGENT_PATH);
+	// The write end closes on exec or exit, which unblocks the read below.
+	if (pipe(p) < 0) {
+		perror("pipe agent");
+		return;
+	}
+	if (fcntl(p[1], F_SETFD, FD_CLOEXEC) < 0)
+		perror("fcntl agent pipe");
 	pid = fork();
 	if (pid < 0) {
 		perror("fork agent");
+		close(p[0]);
+		close(p[1]);
 		return;
 	} else if (pid == 0) {
+		close(p[0]);
 		if (setpgid(0, 0) < 0) {
 			perror("setpgid agent");
 		}
@@ -1328,6 +1429,10 @@ void spawn_agent() {
 		perror("failed");
 		_exit(127);
 	}
+	close(p[1]);
+	while (read(p[0], &c, 1) < 0 && errno == EINTR)
+		;
+	close(p[0]);
 	agent_pid = pid;
 }
 
