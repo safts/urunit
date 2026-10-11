@@ -71,6 +71,22 @@ static pid_t agent_pid = 0;
 // start when URUNIT_EXIT_STATUS names it; -1 when there is none.
 static int exit_status_fd = -1;
 
+// The app's process group, which SIGTERM and SIGINT sent to urunit are
+// forwarded to; 0 when there is no app to forward to.
+static volatile sig_atomic_t fwd_pgid = 0;
+
+// forward_signal: Passes a termination signal sent to urunit (PID 1, which
+// the kernel would otherwise drop) on to the app's process group, so that a
+// container stop gives the app a chance to shut down gracefully.
+static void forward_signal(int sig) {
+	int saved_errno = errno;
+
+	if (fwd_pgid > 0) {
+		kill(-fwd_pgid, sig);
+	}
+	errno = saved_errno;
+}
+
 struct process_config {
 	uint32_t uid;
 	uint32_t gid;
@@ -1399,6 +1415,9 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 	} else if (pid == 0) {
 		return child_func(new_argv);
 	}
+	// Also set the group here, so it exists before a signal is forwarded to
+	// it; whichever of parent and child runs first wins.
+	setpgid(pid, pid);
 
 	*child_pid = pid;
 
@@ -1592,6 +1611,9 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 			if (errno == ECHILD) {
 				break;
 			}
+			if (errno == EINTR) {
+				continue;
+			}
 			perror("reaping");
 			return 1;
 
@@ -1602,6 +1624,8 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 			// A child was reaped. Check whether it's the app.
 			// If it is, then set the exit_code,
 			if (reaped_pid == child_pid) {
+				// Never forward to the app's group again: it may be reused.
+				fwd_pgid = 0;
 				if (WIFEXITED(reaped_status)) {
 					DEBUG_PRINTF("with exit status %d\n", WEXITSTATUS(reaped_status));
 					// The app exited normally
@@ -1707,6 +1731,17 @@ int main(int argc, char *argv[]) {
 	if (ret) {
 		fprintf(stderr, "Could not spawn app\n");
 		return ret;
+	}
+
+	// Installed after the fork, so the app never inherits the handler.
+	fwd_pgid = app_pid;
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = forward_signal;
+	sa.sa_flags = SA_RESTART;
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGTERM, &sa, NULL) < 0 || sigaction(SIGINT, &sa, NULL) < 0) {
+		perror("sigaction");
 	}
 
 	DEBUG_PRINT("Starting reaping loop\n");
