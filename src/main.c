@@ -45,6 +45,7 @@
 #include <signal.h>
 
 #include <fcntl.h>
+#include <grp.h>
 #include <signal.h>
 #include <errno.h>
 #include <string.h>
@@ -93,6 +94,8 @@ struct process_config {
 	char     *wdir;
 	uint32_t argc;
 	char     **argv;
+	gid_t    *gids;
+	size_t   ngids;
 };
 
 struct app_exec_config {
@@ -481,6 +484,7 @@ int get_string_val(char *str, char **value) {
 // UCS
 // UID:<uid>
 // GID:<gid>
+// AGID:<gid>                     (optional, repeatable, one per supplementary group)
 // WD:<working directory>
 // ARC:<number of arguments>      (optional, followed by ARC records of)
 // ARV:<argument>                 (taken verbatim)
@@ -525,6 +529,22 @@ int parse_process_config(struct record_iter *iter, struct process_config **pconf
 				fprintf(stderr, "Failed to retreive GID information from %s\n", rec);
 				break;
 			}
+		} else if (is_field(rec, "AGID")) {
+			uint32_t agid = 0;
+			gid_t *gids = NULL;
+
+			ret = get_uint_val(rec, &agid);
+			if (ret != 0) {
+				fprintf(stderr, "Failed to retrieve AGID information from %s\n", rec);
+				break;
+			}
+			gids = realloc(conf->gids, (conf->ngids + 1) * sizeof(gid_t));
+			if (!gids) {
+				fprintf(stderr, "Failed to allocate memory for the supplementary groups\n");
+				break;
+			}
+			gids[conf->ngids++] = agid;
+			conf->gids = gids;
 		} else if (is_field(rec, "WD")) {
 			ret = get_string_val(rec, &(conf->wdir));
 			if (ret != 0) {
@@ -575,6 +595,7 @@ int parse_process_config(struct record_iter *iter, struct process_config **pconf
 	if (!rec)
 		fprintf(stderr, "Invalid format of application execution environment configuration. \"UCE\" was not found\n");
 	free(conf->argv);
+	free(conf->gids);
 	free(conf);
 	return -1;
 }
@@ -944,8 +965,10 @@ struct app_exec_config *get_config_from_file(char *file, char **sbuf) {
 
 get_env_vars_error_free:
 	free(env_vars);
-	if (pconf)
+	if (pconf) {
 		free(pconf->argv);
+		free(pconf->gids);
+	}
 	free(pconf);
 	free_block_config(bconf);
 	free(tconf);
@@ -1163,6 +1186,17 @@ int setup_exec_env(struct process_config *process_conf) {
 		return 0;
 	}
 
+	// Supplementary groups must be set while urunit still has CAP_SETGID,
+	// i.e. before setuid. Without AGID records the group list is left as is.
+	if (process_conf->ngids > 0) {
+		DEBUG_PRINTF("Setting %zu supplementary groups\n", process_conf->ngids);
+		ret = setgroups(process_conf->ngids, process_conf->gids);
+		if (ret < 0) {
+			perror("set groups");
+			return 1;
+		}
+	}
+
 	DEBUG_PRINTF("Setting gid to %d\n", process_conf->gid);
 	ret = setgid(process_conf->gid);
 	if (ret < 0) {
@@ -1269,8 +1303,10 @@ int child_func(char *argv[]) {
 child_func_free:
 	if (app_config) {
 		free(app_config->envs);
-		if (app_config->pr_conf)
+		if (app_config->pr_conf) {
 			free(app_config->pr_conf->argv);
+			free(app_config->pr_conf->gids);
+		}
 		free(app_config->pr_conf);
 		free_block_config(app_config->blk_conf);
 		free(app_config->tmpfs_conf);

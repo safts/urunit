@@ -118,6 +118,8 @@ UEE
 UCS
 UID: <uid_for_the_application>
 GID: <gid_for_the_application>
+AGID: <supplementary_gid>
+...
 WD:  <working_directory>
 ARC: <number_of_application_arguments>
 ARV: <application_argument>
@@ -148,6 +150,14 @@ this command takes precedence over the arguments `urunit` was started with;
 otherwise `urunit` executes its own command line. The kernel command line limits
 both the length of the command and the number of arguments, so a runtime should
 pass long commands through the configuration.
+
+`AGID` is optional and may be repeated, one record per supplementary group of
+the application (for example the OCI `process.user.additionalGids`), in the
+order they should be applied. `urunit` applies them with `setgroups` before it
+switches to the application's `GID` and `UID`. Without any `AGID` record the
+group list is left as is. On FreeBSD before 15, the first entry of the group
+list is the effective gid, which the following `setgid` overwrites, so a runtime
+should list the primary gid first (as containerd's CRI does).
 
 The `UTS` section is optional and lists tmpfs mounts that `urunit` creates
 inside the guest before it starts the application. Every entry begins with `MP`,
