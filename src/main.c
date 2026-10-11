@@ -1173,11 +1173,11 @@ int setup_exec_env(struct process_config *process_conf) {
 	return 0;
 }
 
-int child_func(int argc, char *argv[]) {
+int child_func(char *argv[]) {
 	struct app_exec_config *app_config = NULL;
 	char *app_config_buf = NULL;
-	// The command line was already reassembled by spawn_app. When there is
-	// none, the application command comes from the configuration instead.
+	// The command line was already reassembled by spawn_app. A command in
+	// the configuration takes precedence over it.
 	char **exec_argv = argv;
 	int ret = 0;
 
@@ -1204,10 +1204,10 @@ int child_func(int argc, char *argv[]) {
 		}
 	}
 
-	// No command line (e.g. started by the FreeBSD kernel as init): take the
-	// application command from the configuration, where every argument is
-	// already separated and the array is NULL terminated.
-	if (argc < 2 && app_config && app_config->pr_conf &&
+	// The configuration's command (ARC/ARV) wins over the command line: the
+	// kernel command line limits both length and argument count, while here
+	// every argument is already separated and the array is NULL terminated.
+	if (app_config && app_config->pr_conf &&
 	    app_config->pr_conf->argv && app_config->pr_conf->argc > 0) {
 		DEBUG_PRINT("Taking the application command from the configuration\n");
 		exec_argv = app_config->pr_conf->argv;
@@ -1266,10 +1266,25 @@ child_func_free:
 	return ret;
 }
 
+// Size of a buffer that can hold argv[from..argc-1] joined by spaces.
+static size_t joined_size(int argc, char *argv[], int from) {
+	size_t size = 1;
+
+	for (int k = from; k < argc; k++) {
+		size += strlen(argv[k]) + 1;
+	}
+	return size;
+}
+
 int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 	int i = 0;
 	pid_t pid;
-	char *new_argv[128];
+	// Rejoining never yields more entries than argc - 1, plus the NULL.
+	char **new_argv = calloc((size_t)argc + 1, sizeof(char *));
+	if (!new_argv) {
+		fprintf(stderr, "Failed to allocate the application arguments\n");
+		return 1;
+	}
 	// The arguments of the app are the same as the ones for urunit, but
 	// removing the urunit argv[0]. Therefore:
 	int new_argc = 0;
@@ -1287,7 +1302,11 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 			// This arg (and everything until we encounter a ')
 			// is part of the same argument
 			int j = 0;
-			char buffer[1024] = {0};
+			char *buffer = calloc(joined_size(argc, argv, i), 1);
+			if (!buffer) {
+				fprintf(stderr, "Failed to allocate an application argument\n");
+				return 1;
+			}
 
 			strcat(buffer, tmp_arg + 1); // skip '
 			for (j = i + 1; j < argc; j++) {
@@ -1318,7 +1337,7 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 					break;
 				}
 			}
-			new_argv[new_argc++] = strdup(buffer);
+			new_argv[new_argc++] = buffer;
 			break;
 		} else if (tmp_arg[0] == '"') {
 			// The below is safe since the tmp_arg has at least one char
@@ -1330,7 +1349,11 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 			// This arg (and everything until we encounter a ")
 			// is part of the same argument
 			int j = 0;
-			char buffer[1024] = {0};
+			char *buffer = calloc(joined_size(argc, argv, i), 1);
+			if (!buffer) {
+				fprintf(stderr, "Failed to allocate an application argument\n");
+				return 1;
+			}
 
 			strcat(buffer, tmp_arg + 1); // skip "
 			for (j = i + 1; j < argc; j++) {
@@ -1361,7 +1384,7 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 					break;
 				}
 			}
-			new_argv[new_argc++] = strdup(buffer);
+			new_argv[new_argc++] = buffer;
 			break;
 		} else {
 			new_argv[new_argc++] = argv[i];
@@ -1374,7 +1397,7 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 		perror("fork");
 		return 1;
 	} else if (pid == 0) {
-		return child_func(argc, new_argv);
+		return child_func(new_argv);
 	}
 
 	*child_pid = pid;
