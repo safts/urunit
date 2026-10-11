@@ -143,8 +143,11 @@ UNE
 
 Inside the `UCS` section, the application command is optional: `ARC` holds the
 number of arguments and is followed by exactly that many `ARV` lines, one per
-argument, each taken verbatim. It is used when `urunit` is started without a
-command line, in which case the command from the configuration is executed.
+argument, each taken verbatim. When `ARC` is present with a non-zero count,
+this command takes precedence over the arguments `urunit` was started with;
+otherwise `urunit` executes its own command line. The kernel command line limits
+both the length of the command and the number of arguments, so a runtime should
+pass long commands through the configuration.
 
 The `UTS` section is optional and lists tmpfs mounts that `urunit` creates
 inside the guest before it starts the application. Every entry begins with `MP`,
