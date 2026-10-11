@@ -61,8 +61,8 @@
 #define STOP_GRACE_SECS 5
 
 // URUNIT_AGENT_PATH: The agent (e.g. the urunc exec agent) urunit starts as
-// its own child before the application, when the file exists and is
-// executable. It is staged there by the boot initrd of a container boot.
+// its own child once the application has been set up, when the file exists
+// and is executable. It is staged there by the boot initrd of a container boot.
 #define URUNIT_AGENT_PATH "/run/urunc/urunit-agent"
 
 // The pid of the agent urunit started, 0 when there is none or it was reaped.
@@ -83,7 +83,11 @@ static void forward_signal(int sig) {
 	int saved_errno = errno;
 
 	if (fwd_pgid > 0) {
-		kill(-fwd_pgid, sig);
+		// While the app child is still setting up, its group does not
+		// exist yet; signal the child itself then.
+		if (kill(-fwd_pgid, sig) < 0 && errno == ESRCH) {
+			kill(fwd_pgid, sig);
+		}
 	}
 	errno = saved_errno;
 }
@@ -1337,9 +1341,10 @@ static size_t joined_size(int argc, char *argv[], int from) {
 	return size;
 }
 
-int spawn_app(int argc, char *argv[], pid_t *child_pid) {
+int spawn_app(int argc, char *argv[], pid_t *child_pid, int *ready_fd) {
 	int i = 0;
 	pid_t pid;
+	int p[2];
 	// Rejoining never yields more entries than argc - 1, plus the NULL.
 	char **new_argv = calloc((size_t)argc + 1, sizeof(char *));
 	if (!new_argv) {
@@ -1453,18 +1458,30 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 	}
 	new_argv[new_argc] = NULL;
 
+	// The child keeps the write end, which closes when the app exec's (or
+	// the child exits), so EOF on the read end means the guest is set up.
+	// The child's own setsid() needs it not to lead a process group, so
+	// the parent does not setpgid() it.
+	if (pipe(p) < 0) {
+		perror("pipe app");
+		return 1;
+	}
+	if (fcntl(p[1], F_SETFD, FD_CLOEXEC) < 0)
+		perror("fcntl app pipe");
 	pid = fork();
 	if (pid < 0) {
 		perror("fork");
+		close(p[0]);
+		close(p[1]);
 		return 1;
 	} else if (pid == 0) {
+		close(p[0]);
 		return child_func(new_argv);
 	}
-	// Also set the group here, so it exists before a signal is forwarded to
-	// it; whichever of parent and child runs first wins.
-	setpgid(pid, pid);
+	close(p[1]);
 
 	*child_pid = pid;
+	*ready_fd = p[0];
 
 	return 0;
 }
@@ -1476,53 +1493,40 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 // reaping loop like every other child; its exit does not end the guest, and
 // it is asked to exit (SIGTERM) once the application has exited. A failure to
 // start it is reported and does not prevent the application from starting.
-// It returns only once the agent has exec'd (or failed to), so that a mount
-// the application child makes (e.g. a tmpfs over /run) can not race the exec.
+// The agent is exec'd from a descriptor opened before the application child
+// could mount anything, so a mount over its path (e.g. a tmpfs over /run)
+// can not hide it.
 //
 // Arguments:
-// No arguments.
+// 1. fd:	The agent binary opened with O_CLOEXEC, or -1 if there is none
 //
 // Return value:
 // No return value.
-void spawn_agent() {
+void spawn_agent(int fd) {
 	char *agent_argv[] = { URUNIT_AGENT_PATH, NULL };
 	pid_t pid;
-	int p[2];
-	char c;
 
-	if (access(URUNIT_AGENT_PATH, X_OK) != 0) {
+	if (fd < 0) {
 		DEBUG_PRINTF("No agent at %s, nothing to start\n", URUNIT_AGENT_PATH);
 		return;
 	}
 
 	DEBUG_PRINTF("Starting agent %s\n", URUNIT_AGENT_PATH);
-	// The write end closes on exec or exit, which unblocks the read below.
-	if (pipe(p) < 0) {
-		perror("pipe agent");
-		return;
-	}
-	if (fcntl(p[1], F_SETFD, FD_CLOEXEC) < 0)
-		perror("fcntl agent pipe");
 	pid = fork();
 	if (pid < 0) {
 		perror("fork agent");
-		close(p[0]);
-		close(p[1]);
+		close(fd);
 		return;
 	} else if (pid == 0) {
-		close(p[0]);
 		if (setpgid(0, 0) < 0) {
 			perror("setpgid agent");
 		}
-		execv(agent_argv[0], agent_argv);
+		fexecve(fd, agent_argv, environ);
 		fprintf(stderr, "exec agent %s ", agent_argv[0]);
 		perror("failed");
 		_exit(127);
 	}
-	close(p[1]);
-	while (read(p[0], &c, 1) < 0 && errno == EINTR)
-		;
-	close(p[0]);
+	close(fd);
 	agent_pid = pid;
 }
 
@@ -1731,6 +1735,9 @@ int main(int argc, char *argv[]) {
 	pid_t app_pid;
 	int ret = 0;
 	int app_exitcode = -1;
+	int agent_fd = -1;
+	int ready_fd = -1;
+	char ready;
 	char *should_set_def_route = NULL;
 	uint8_t free_boot_var = 0;
 
@@ -1766,13 +1773,12 @@ int main(int argc, char *argv[]) {
 
 	open_exit_status();
 
-	// The agent is started before the app, as urunit's own child, so that
-	// urunit reaps it too.
-	DEBUG_PRINT("Spawn the agent, if any\n");
-	spawn_agent();
+	// Open the agent before the app child can mount over its path; it is
+	// started only once the app is set up (see below).
+	agent_fd = open(URUNIT_AGENT_PATH, O_RDONLY | O_CLOEXEC);
 
 	DEBUG_PRINT("Spawn the app\n");
-	ret = spawn_app(argc, argv, &app_pid);
+	ret = spawn_app(argc, argv, &app_pid, &ready_fd);
 	if (ret) {
 		fprintf(stderr, "Could not spawn app\n");
 		return ret;
@@ -1788,6 +1794,15 @@ int main(int argc, char *argv[]) {
 	if (sigaction(SIGTERM, &sa, NULL) < 0 || sigaction(SIGINT, &sa, NULL) < 0) {
 		perror("sigaction");
 	}
+
+	// Start the agent, as urunit's own child so urunit reaps it too, only
+	// once the app child has set up the guest (/proc, /sys, network, mounts)
+	// and exec'd the app, so an exec never sees a half-built guest.
+	while (read(ready_fd, &ready, 1) < 0 && errno == EINTR)
+		;
+	close(ready_fd);
+	DEBUG_PRINT("Spawn the agent, if any\n");
+	spawn_agent(agent_fd);
 
 	DEBUG_PRINT("Starting reaping loop\n");
 	while (1) {
