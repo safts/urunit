@@ -56,6 +56,9 @@
 #define STATUS_MAX 255
 #define STATUS_MIN 0
 
+// Seconds the processes left after the app exits get to stop on SIGTERM.
+#define STOP_GRACE_SECS 5
+
 // URUNIT_AGENT_PATH: The agent (e.g. the urunc exec agent) urunit starts as
 // its own child before the application, when the file exists and is
 // executable. It is staged there by the boot initrd of a container boot.
@@ -1455,6 +1458,60 @@ void stop_agent() {
 	}
 }
 
+// reap_for: Reaps children for up to tenths tenths of a second, returning
+// early once there are none left. Only the sleeps count towards the limit, so
+// many children exiting at once do not cut the wait short.
+static void reap_for(int tenths) {
+	pid_t pid;
+
+	while (tenths > 0) {
+		pid = waitpid(-1, NULL, WNOHANG);
+		if (pid > 0) {
+			continue;
+		}
+		if (pid < 0 && errno != EINTR) {
+			if (errno != ECHILD) {
+				perror("reaping");
+			}
+			return;
+		}
+		if (pid == 0) {
+			usleep(100000);
+			tenths--;
+		}
+	}
+}
+
+// terminate_remaining: Called once the application has exited. The app is
+// what the guest is for, so anything still running (a process an exec left
+// in the background, a daemon the app forked) would only keep the guest up.
+// As with runc, where the kernel kills the rest of the container once its
+// init exits, the container ends with its process: send SIGTERM to every
+// other process, give them STOP_GRACE_SECS to exit, then SIGKILL whatever is
+// left, and reap it so its files are closed before the sync and unmount.
+// Only done as PID 1, where kill(-1) is confined to the guest.
+//
+// Arguments:
+// No arguments.
+//
+// Return value:
+// No return value.
+void terminate_remaining(void) {
+	if (getpid() != 1) {
+		return;
+	}
+	DEBUG_PRINT("Sending SIGTERM to the remaining processes\n");
+	if (kill(-1, SIGTERM) < 0 && errno != ESRCH) {
+		perror("kill SIGTERM");
+	}
+	reap_for(STOP_GRACE_SECS * 10);
+	DEBUG_PRINT("Sending SIGKILL to the remaining processes\n");
+	if (kill(-1, SIGKILL) < 0 && errno != ESRCH) {
+		perror("kill SIGKILL");
+	}
+	reap_for(10);
+}
+
 // open_exit_status: Opens (and truncates) the file named by
 // URUNIT_EXIT_STATUS, before anything else can mount over its directory.
 // Failures are reported and ignored.
@@ -1544,11 +1601,25 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 				record_exit_status(reaped_status);
 
 				// The app is done. The agent urunit started would
-				// otherwise run forever, so ask it to exit; it is
-				// reaped by this loop like every other child. Nothing
-				// else is signalled: any other process still around
-				// is the app's responsibility.
+				// otherwise run forever, so ask it to exit.
 				stop_agent();
+
+				/* The app is what we are here to supervise, so stop
+				 * waiting now that it is gone. Continuing would block
+				 * in waitpid() on whatever else is still running --
+				 * a sidecar started before us and inherited when we
+				 * became PID 1, for instance -- and that process has
+				 * no reason to ever exit. main() would then never get
+				 * to see the exit code, and the shutdown below it
+				 * (sync, unmount, reboot) would never run: the guest
+				 * stays up forever with nothing left to do.
+				 *
+				 * Anything still alive is terminated by
+				 * terminate_remaining() before the shutdown syncs and
+				 * unmounts and asks the platform to power the machine
+				 * off.
+				 */
+				return 0;
 			} else if (reaped_pid == agent_pid) {
 				// Forget the agent, so that its pid is not signalled
 				// later, when it may have been reused.
@@ -1626,6 +1697,10 @@ int main(int argc, char *argv[]) {
 		if (app_exitcode != -1) {
 			break;
 		}
+	}
+
+	if (app_exitcode != -1) {
+		terminate_remaining();
 	}
 
 	DEBUG_PRINT("Exiting, will reboot in order to shutdown\n");
